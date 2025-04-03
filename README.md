@@ -8,7 +8,6 @@ In this repo, we show how to build, deploy and test a multi-agent system that ca
 
 ![image](./imgs/insurance_chat_agent.png)
 
-
 ## Reference:
 
 * [Databricks Agent Tools](https://docs.databricks.com/aws/en/generative-ai/agent-framework/agent-tool)
