@@ -6,6 +6,16 @@ Author:
 
 In this repo, we show how to build, deploy and test a multi-agent system that can answer insurance claim and policy questions using OpenAI Agents SDK on Databricks.
 
+Minimum requirements:
+
+- Unity Catalog and serverless enabled Databricks Workspace
+
+To following the blog post:
+
+- Clone this repo in your databricks workspace
+- Import the example [datasets](./datasets) as Unity Catalog tables
+- Follow the [driver notebooks](./insurance_chat_agent/insurance_chat_agent_driver.ipynb)
+
 ![image](./imgs/insurance_chat_agent.png)
 
 ## Reference:
