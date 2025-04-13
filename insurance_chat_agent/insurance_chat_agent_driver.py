@@ -1,6 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Insurance Agent with UC Tools
+# MAGIC # Building a multi-agent system with OpenAI Agents SDK on Databricks
+# MAGIC
+# MAGIC This notebook is the companion to the blog post [Building a multi-agent system with OpenAI Agents SDK on Databricks](https://medium.com/@AI-on-Databricks/building-a-multi-agent-system-with-openai-agents-sdk-on-databricks-6b6ad6774477)
+# MAGIC
+# MAGIC OpenAI recently released its own [Agents SDK](https://github.com/openai/openai-agents-python/tree/main) — it is a lightweight yet powerful framework for building multi-agent workflows.
+# MAGIC
+# MAGIC In this notebook, we demonstrate how to leverage the OpenAI Agents SDK and Databricks’ features to build and deploy an insurance-policy Q&A agent on the Databricks Data Intelligence Platform.
+# MAGIC
+# MAGIC
+# MAGIC **Note**:
+# MAGIC
+# MAGIC * The notebook is best to be run in a Unity Catalog enabled Databricks Workspace with serverless compute cluster
+# MAGIC * The example datasets are provided [here](https://github.com/qian-yu-db/OpenAI_Agents_SDK_on_Databricks/tree/main/datasets)
 
 # COMMAND ----------
 
@@ -14,18 +26,71 @@ import os
 import warnings
 
 # Pull your OpenAI API key from Databricks secrets
-os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(scope="my_secret_scope", key="OpenAI")
+my_scrept_scope = "TO BE REPLACED"
+os.environ["OPENAI_API_KEY"] = dbutils.secrets.get(scope=f"my_secret_scope", key="OpenAI")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # Set MLflow Experiment
+my_databricks_account = "TO BE REPLACED"
 mlflow.set_experiment(f"/Users/{my_databricks_account}/ML_experiments/insurance_chat_agent")
 mlflow.openai.autolog()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Bring Tools
+# MAGIC ## Set up UC Tools
+# MAGIC
+# MAGIC The key components of an Agentic system are LLM(s), Tools/knowledge Base(s), Orchastrator, and evaluation.
+# MAGIC
+# MAGIC ![image](../imgs/multi-agent-workflow.webp)
+# MAGIC
+# MAGIC The UC tools can be convieniently created by using SQL syntax as below. We create the following UC functions for our AI insurance agent:
+# MAGIC
+# MAGIC - `search_claims_details_by_policy_no`: a SQL function that retrieves a customer’s claim history based on their policy number. Since it is governed by UC, it follows the 3-level namespace when defining the name of the UC function.
+# MAGIC - `policy_docs_vector_search`: a Databricks SQL AI Function that retrieves relevant document chunks from a Databricks Vector Search index using the approximate nearest neighbor (ANN) algorithm on an input query. Alternatively one can also define this tool using the Databricks AI Bridge `VectorSearchRetrieverTool`. See more details [`here`](https://docs.databricks.com/aws/en/generative-ai/agent-framework/unstructured-retrieval-tools).
+# MAGIC
+# MAGIC
+# MAGIC Please replace `catalog`, `schema` with your UC catalog and schema names.
+# MAGIC
+# MAGIC ```sql
+# MAGIC -- Create a SQL function that searches for claims details by policy_no
+# MAGIC CREATE OR REPLACE FUNCTION catalog.schema.search_claims_details_by_policy_no (
+# MAGIC     input_policy_no STRING COMMENT 'Policy number'
+# MAGIC )
+# MAGIC RETURNS TABLE
+# MAGIC COMMENT 'Returns policy details about a customer given policy_no.'
+# MAGIC RETURN
+# MAGIC SELECT *
+# MAGIC FROM catalog.schema.claims_table
+# MAGIC WHERE policy_no = input_policy_no
+# MAGIC ;
+# MAGIC
+# MAGIC -- Create a SQL function that calls the vector_search() AI Function
+# MAGIC CREATE OR REPLACE FUNCTION catalog.schema.policy_docs_vector_search (
+# MAGIC     query STRING
+# MAGIC     COMMENT 'The query string for searching insurance policy documentation.'
+# MAGIC )
+# MAGIC RETURNS TABLE
+# MAGIC COMMENT 'Executes a search on insurance policy documentation to retrieve text documents most relevant to the input query.'
+# MAGIC RETURN
+# MAGIC SELECT
+# MAGIC     chunked_text as page_content,
+# MAGIC     map('doc_path', path, 'chunk_id', chunk_id) as metadata
+# MAGIC FROM
+# MAGIC     vector_search(
+# MAGIC         index => catalog.schema.policy_docs_chunked_files_vs_index',
+# MAGIC         query => query,
+# MAGIC         num_results => 3
+# MAGIC     )
+# MAGIC ;
+# MAGIC ```
+# MAGIC
+# MAGIC To make UC functions work as tools with OpenAI Agents SDK, We uses [unity catalog OpenAI integration](https://github.com/unitycatalog/unitycatalog/tree/main/ai/integrations/openai) to perform UC function calls and they need to be wrapped under the `@function_tool` decorator.
+# MAGIC
+# MAGIC In addition, it supports Pydantic as a way to inject contexts into the agent, tool, or handoffs, or to enforce output type from an agent. Here we create a `UserInfo` class with a Pydantic base model with customer ID and policy number as arguments, which is used as context. The `conversation_id` and `user_id` are context parameters for MLflow `ChatAgent`, they are included so that we can log this workflow as a `ChatAgent` model.
+# MAGIC
+# MAGIC
 
 # COMMAND ----------
 
@@ -36,6 +101,11 @@ class UserInfo(BaseModel):
     policy_no: str | None = None
     conversation_id: str | None = None
     user_id: str | None = None
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Define Tools
 
 # COMMAND ----------
 
@@ -68,7 +138,14 @@ def policy_docs_vector_search(query: str) -> FunctionExecutionResult:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Build Agents
+# MAGIC ## Create Agents
+# MAGIC
+# MAGIC A multi-agent system is like a conversation between LLMs that work together to solve a problem, which requires “handing off” prompts, contexts, and outputs from one LLM (i.e. a single agent) to another.
+# MAGIC
+# MAGIC
+# MAGIC Here is a visualization of the multi-agent system
+# MAGIC
+# MAGIC ![image](../imgs/insurance_chat_agent.png)
 
 # COMMAND ----------
 
@@ -96,6 +173,11 @@ client = AsyncOpenAI(
     api_key=API_KEY,
 )
 
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The instruction field is the prompt for the agent. We’ve added a `RECOMMENDED_PROMPT_PREFIX` object from OpenAI. This is a optional “hand-off” prompt, and we found it to work fairly well. The tools field is where you designate a list of tools that the agent can use to complete the task specified in the instruction. The model field is where you specify the LLM that powers the agent. It works natively with all OpenAI models, provided that you have access to them
 
 # COMMAND ----------
 
@@ -159,6 +241,11 @@ triage_agent = Agent[UserInfo](
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Experiment with MLflow
+
+# COMMAND ----------
+
 # Input some user data as context
 user_info = UserInfo(cust_id="1234", policy_no="12345678", coversation_id="123", user_id="123")
 user_input = "[USER]: I'like to check on my existing claims"
@@ -190,7 +277,20 @@ result = await Runner.run(triage_agent, input=user_input, context=user_info)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Write the agent chat model to file
+# MAGIC ## Log, Register and Deploy with Mosaic Agent Framework
+# MAGIC
+# MAGIC In order to deploy the chatbot as a “model”, and serve it on Databricks Model Serving, there are a few key steps:
+# MAGIC
+# MAGIC - Wrap your agent code in a mlflow.pyfunc.ChatAgent interface as a custom “model”. This schema specification is designed for agent scenarios and is similar to, but not strictly compatible with, the OpenAI ChatCompletion schema.
+# MAGIC - Log and register the multi-agent system to MLflow and to UC.
+# MAGIC - Use the `agents.deploy()` function to deploy your chatbot as a REST API endpoint, and instantiate a Review App to begin the evaluation loop.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Write the agent chat model to file to prepare for logging the model
+# MAGIC
+# MAGIC
 
 # COMMAND ----------
 
@@ -378,7 +478,7 @@ result = await Runner.run(triage_agent, input=user_input, context=user_info)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load from file and Log & register agent
+# MAGIC ### Load from agent python code and run a couple of validations
 
 # COMMAND ----------
 
@@ -413,6 +513,14 @@ AGENT.predict({
         "messages": [{"role": "user", "content": "does my policy cover towing and labor costs?"}],
         "context": {"conversation_id": "123", "user_id": "123"}
 })
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ### Logging the model
+# MAGIC
+# MAGIC To enable automatic authentication passthrough, since the chatbot needs access to data on Databricks, [specify dependent resources](https://docs.databricks.com/aws/en/generative-ai/agent-framework/log-agent#-specify-resources-for-automatic-authentication-passthrough-system-authentication) using the resources parameter of the MLflow log_model() API.
 
 # COMMAND ----------
 
@@ -471,6 +579,11 @@ with mlflow.start_run():
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Test logged the model
+
+# COMMAND ----------
+
 import nest_asyncio
 
 nest_asyncio.apply()
@@ -502,6 +615,11 @@ response = loaded_model.predict({
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Registered the model
+
+# COMMAND ----------
+
 mlflow.set_registry_uri("databricks-uc")
 
 catalog = "ai"
@@ -517,12 +635,12 @@ uc_registered_model_info = mlflow.register_model(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Deploy to an endpoint
+# MAGIC ### Deploy to an endpoint
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Pre-deployment Env Test
+# MAGIC #### Pre-deployment Env Test
 
 # COMMAND ----------
 
@@ -538,7 +656,7 @@ mlflow.models.predict(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Deploy
+# MAGIC #### Deploy
 
 # COMMAND ----------
 
@@ -553,5 +671,3 @@ agents.deploy(
     },
     tags={"endpoint_desc": "insurance_chat_agent_openai_agent_sdk"},
 )
-
-
